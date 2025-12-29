@@ -13,11 +13,16 @@ static struct cdev hello_cdev;   // 字符设备对象
 static struct class *hello_class;
 
 struct hello_file_ctx{
-	char buf[BUF_SIZE];
-	size_t len;
+	struct hello_device *dev;
 };
 
+struct hello_device {
+    char buf[128];
+    size_t len;
+    struct mutex lock;
+};
 
+static struct hello_device hello_dev;		// 设备级共享
 
 
 
@@ -28,7 +33,8 @@ static int hello_open(struct inode *inode, struct file *file)
     ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
     if (!ctx)
         return -ENOMEM;
-	ctx->len = 0;
+	
+	ctx->dev = &hello_dev;
     file->private_data = ctx;
 
     pr_info("hello: open called, ctx=%px\n", ctx);
@@ -51,18 +57,25 @@ static ssize_t hello_write(struct file *file,
                            size_t count,
                            loff_t *ppos)
 {
-    struct hello_file_ctx *ctx = file->private_data;
+    struct hello_file_ctx *ctx = file->private_data;	
+	struct hello_device *dev = ctx->dev;
     size_t to_copy;
-
     to_copy = min(count, (size_t)(BUF_SIZE - 1));
 
-    if (copy_from_user(ctx->buf, ubuf, to_copy))
+	mutex_lock(&dev->lock);
+	
+    if (copy_from_user(dev->buf, ubuf, to_copy))
+    {
+    	mutex_unlock(&dev->lock);
         return -EFAULT;
+    }
 
-    ctx->buf[to_copy] = '\0';
-    ctx->len = to_copy;
-
-    pr_info("hello: write %zu bytes: %s\n", to_copy, ctx->buf);
+    dev->buf[to_copy] = '\0';
+    dev->len = to_copy;
+	
+	mutex_unlock(&dev->lock);
+	
+    pr_info("hello: write %zu bytes: %s\n", to_copy, dev->buf);
     return to_copy;
 }
 
@@ -72,16 +85,27 @@ static ssize_t hello_read(struct file *file,
                           loff_t *ppos)
 {
     struct hello_file_ctx *ctx = file->private_data;
-
-    if (ctx->len - *ppos <= 0)
+	struct hello_device *dev = ctx->dev;
+	
+	mutex_lock(&dev->lock);
+	
+    if (*ppos >= dev->len)
+    {
+    	mutex_unlock(&dev->lock);
         return 0;   // EOF
+    }
 
-    if (count > ctx->len - *ppos)
-        count = ctx->len - *ppos;
+    if (count > dev->len - *ppos)
+        count = dev->len - *ppos;
 
-    if (copy_to_user(ubuf, ctx->buf + *ppos, count))
-        return -EFAULT;
-
+    if (copy_to_user(ubuf, dev->buf + *ppos, count))
+    {
+		mutex_unlock(&dev->lock);
+		return -EFAULT;
+    }
+	
+	mutex_unlock(&dev->lock);
+	
     *ppos += count;
     return count;
 }
@@ -101,6 +125,9 @@ static struct file_operations hello_fops = {
 static int __init hello_init(void)
 {
 	int ret;
+	// 创建设备级共享结构
+	mutex_init(&hello_dev.lock);
+    hello_dev.len = 0;
 	
 	// 申请设备号
 	ret = alloc_chrdev_region(&devno, 0, 1, DEVICE_NAME);
